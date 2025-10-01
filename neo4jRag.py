@@ -43,6 +43,7 @@ except ImportError as exc:  # pragma: no cover - provides actionable hint if pac
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
+<<<<<<< HEAD
 try:  # Optional Qdrant dependency for hybrid retrieval
     from qdrant_client import QdrantClient
     from qdrant_client.http import models as qmodels
@@ -50,6 +51,8 @@ except ImportError:  # pragma: no cover - keep runtime optional
     QdrantClient = None  # type: ignore
     qmodels = None  # type: ignore
 
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
 logger = logging.getLogger(__name__)
 
 
@@ -65,14 +68,21 @@ def _load_environment() -> None:
 
 @dataclass
 class SkillRecord:
+<<<<<<< HEAD
     """Lightweight container for skill descriptors returned from the graph or vector store."""
+=======
+    """Lightweight container for skill descriptors returned from the graph."""
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
 
     element_id: str
     name: str
     description: str
     importance: float
     level: float
+<<<<<<< HEAD
     source: str = "graph"  # graph | vector
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
 
     @property
     def text(self) -> str:
@@ -306,6 +316,7 @@ class SkillGraphClient:
         suggestions.sort(key=lambda item: (item.overlap_score, item.shared_skill_count), reverse=True)
         return suggestions[:limit]
 
+<<<<<<< HEAD
 
 class SkillGraphVectorStore:
     """Vector search helper backed by Qdrant for semantic skill matching."""
@@ -525,6 +536,8 @@ class SkillGraphVectorStore:
             if existing is None or record.importance > existing.importance:
                 skills[element_id] = record
         return sorted(skills.values(), key=lambda rec: rec.importance, reverse=True)
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
     def occupation_context(
         self,
         occupation_code: str,
@@ -702,7 +715,10 @@ class SkillGraphVectorStore:
                             description=content.get("description", ""),
                             importance=importance,
                             level=level,
+<<<<<<< HEAD
                             source="graph",
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
                         )
                         cls._local_skill_records.setdefault(occ_code, []).append(record)
                         importance_map = cls._local_skill_importance.setdefault(occ_code, {})
@@ -740,6 +756,7 @@ class SkillGraphVectorStore:
         finally:
             cls._local_loaded = True
 
+<<<<<<< HEAD
         # Aggregate base occupation records from variant codes where needed
         variant_groups: Dict[str, List[str]] = {}
         for code in cls._local_skill_records.keys():
@@ -781,6 +798,8 @@ class SkillGraphVectorStore:
             activity_records.sort(key=lambda rec: rec.get("importance", 0.0), reverse=True)
             cls._local_activity_records[base_code] = activity_records
 
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
     def _local_resolve(self, candidate_title: str, limit: int) -> List[Dict[str, Any]]:
         self._ensure_local_cache()
         results: List[Dict[str, Any]] = []
@@ -875,7 +894,10 @@ class SkillMatcher:
                 "skill": skill,
                 "score": round(score, 3),
                 "matched_user_skill": best_user_skill,
+<<<<<<< HEAD
                 "match_source": "graph",
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
             }
             if score >= similarity_threshold:
                 matched.append(payload)
@@ -974,19 +996,25 @@ class SkillGraphRAG:
         matcher: Optional[SkillMatcher] = None,
         llm: Optional[ChatOpenAI] = None,
         similarity_threshold: float = 0.72,
+<<<<<<< HEAD
         vector_store: Optional['SkillGraphVectorStore'] = None,
         vector_similarity_threshold: float = 0.5,
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
     ) -> None:
         _load_environment()
         self.graph_client = graph_client or SkillGraphClient()
         self.matcher = matcher or SkillMatcher()
         self.similarity_threshold = similarity_threshold
 
+<<<<<<< HEAD
         self.vector_store = vector_store or SkillGraphVectorStore()
         if self.vector_store and not self.vector_store.available():
             self.vector_store = None
         self.vector_similarity_threshold = vector_similarity_threshold
 
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
         self.llm = llm or ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 
     def generate_skill_profile(
@@ -1021,6 +1049,7 @@ class SkillGraphRAG:
             best_match = occupation_matches[0]
             occ_code = best_match["code"]
             graph_skills = self.graph_client.occupation_skills(occ_code, limit=max_skills_per_role)
+<<<<<<< HEAD
             if not graph_skills and self.vector_store:
                 prefix = occ_code.split(".")[0]
                 vector_skills = self.vector_store.fetch_skills_for_prefix(prefix, top_k=max_skills_per_role)
@@ -1035,6 +1064,19 @@ class SkillGraphRAG:
                 max_skills=max_skills_per_role,
             )
             coverage_stats = self._compute_coverage(graph_skills, matching)
+=======
+            matching = self.matcher.match(user_skill_texts, graph_skills, similarity_threshold=self.similarity_threshold)
+            total_importance = sum(skill.importance for skill in graph_skills if skill.importance)
+            covered_importance = sum(item["skill"].importance for item in matching["matched"] if item["skill"].importance)
+            coverage_pct = covered_importance / total_importance if total_importance else 0.0
+            coverage_stats = {
+                "coverage_pct": round(coverage_pct, 4),
+                "covered_importance": round(covered_importance, 3),
+                "total_importance": round(total_importance, 3),
+                "covered_count": len(matching["matched"]),
+                "total_count": len(graph_skills),
+            }
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
 
             skills_covered_table = [
                 {
@@ -1045,7 +1087,10 @@ class SkillGraphRAG:
                     "similarity": item["score"],
                     "resume_term": item["matched_user_skill"],
                     "description": item["skill"].description,
+<<<<<<< HEAD
                     "match_source": item.get("match_source", "graph"),
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
                 }
                 for item in matching["matched"]
             ]
@@ -1085,7 +1130,10 @@ class SkillGraphRAG:
                     "skill_gaps_table": skill_gaps_table,
                     "all_skills_table": all_skills_table,
                     "occupation_context": occupation_context,
+<<<<<<< HEAD
                     "vector_matches": vector_matches,
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
                 }
             )
 
@@ -1100,6 +1148,7 @@ class SkillGraphRAG:
         }
 
     # ------------------------------------------------------------------
+<<<<<<< HEAD
     def _compute_coverage(
         self,
         graph_skills: Sequence[SkillRecord],
@@ -1248,6 +1297,8 @@ class SkillGraphRAG:
         return additions
 
     # ------------------------------------------------------------------
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
     def _summarise_profile(
         self,
         role_profiles: Sequence[Dict[str, Any]],

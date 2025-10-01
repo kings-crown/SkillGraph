@@ -503,6 +503,7 @@ def _dump_output(result: Dict, *, output_path: Optional[Path]) -> None:
                 f"- Coverage for {role}: {pct:.1f}% ({covered}/{total} skills; "
                 f"importance {coverage.get('covered_importance', 0)}/{coverage.get('total_importance', 0)})"
             )
+<<<<<<< HEAD
             split = coverage.get("split") or {}
             official = split.get("official", {})
             vector = split.get("vector", {})
@@ -521,16 +522,25 @@ def _dump_output(result: Dict, *, output_path: Optional[Path]) -> None:
                         importance=vector.get("importance", 0),
                     )
                 )
+=======
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
         top_rows = profile.get("skills_covered_table", [])[:5]
         if top_rows:
             print(f"  Top validated skills for {role}:")
             for row in top_rows:
                 print(
+<<<<<<< HEAD
                     "    - {name} (importance {importance}, similarity {similarity}, source {source}, resume '{resume}')".format(
                         name=row["name"],
                         importance=row["importance"],
                         similarity=row["similarity"],
                         source=row.get("match_source", "graph"),
+=======
+                    "    - {name} (importance {importance}, similarity {similarity}, resume '{resume}')".format(
+                        name=row["name"],
+                        importance=row["importance"],
+                        similarity=row["similarity"],
+>>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
                         resume=row["resume_term"] or "-",
                     )
                 )
