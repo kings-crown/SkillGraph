@@ -88,7 +88,7 @@ CLI options:
 ## 4. Restore the Dump into Neo4j Aura
 1. Open [console.neo4j.io](https://console.neo4j.io) and create a **new** Aura instance.
 2. In the instance card select **Backup & Restore → Upload Dump**.
-3. Upload `onet_dump.zip`, keep the desired database name, and confirm. Aura restarts with the imported data.
+3. Upload unzipped `onet_dump.zip`, keep the desired database name, and confirm. Aura restarts with the imported data.
 4. Launch Neo4j Browser from the console, run `:use onet`, and execute the validation queries above.
 
 ## Alternative: Data Importer Only
