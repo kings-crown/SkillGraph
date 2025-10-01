@@ -1,2 +1,6 @@
 *.dump
+db_30_0_excel
+neo4j_csv
 __pycache__/
+onet_dump.zip
+.env

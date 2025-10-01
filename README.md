@@ -9,6 +9,35 @@ packages them for local exploration or Neo4j Aura deployment.
 - Official O*NET Excel bundle (`db_30_0_excel.zip` placed alongside `Onet.py`)
 - Local Neo4j 5.x install (needed for bulk import and dump creation)
 
+## Environment Variables
+Some downstream tooling (for example Aura access or OpenAI-powered helpers) expects
+connection details and API credentials to be exposed as environment variables.
+
+1. Copy `.env.example` to `.env` and replace the placeholder values with your own
+   Neo4j URI, password, and OpenAI key:
+   ```bash
+   cp .env.example .env
+   # edit .env with your preferred editor
+   ```
+2. Make the variables available in your shell before running automation scripts:
+   ```bash
+   set -a
+   source .env
+   set +a
+   ```
+   (You can also export them manually or load them with tools like `direnv`.)
+3. Access the values from Python as usual:
+   ```python
+   import os
+
+   neo4j_uri = os.environ["NEO4J_URI"]
+   neo4j_user = os.environ["NEO4J_USERNAME"]
+   neo4j_password = os.environ["NEO4J_PASSWORD"]
+   openai_key = os.environ["OPENAI_API_KEY"]
+   ```
+
+Avoid committing the populated `.env` file; it is already ignored via `.gitignore`.
+
 ## 1. Generate Graph Assets
 ```bash
 python3 Onet.py build \
