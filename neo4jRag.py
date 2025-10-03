@@ -398,24 +398,56 @@ class SkillGraphVectorStore:
         assert self._embeddings is not None
 
         client = SkillGraphClient()
-        client._ensure_local_cache()
 
         payloads: List[Dict[str, Any]] = []
-        for occ_code, skills in client._local_skill_records.items():
-            prefix = occ_code.split(".")[0]
-            for record in skills:
-                payloads.append(
-                    {
-                        "occupation_code": occ_code,
-                        "soc_prefix": prefix,
-                        "element_id": record.element_id,
-                        "name": record.name,
-                        "description": record.description,
-                        "importance": record.importance,
-                        "level": record.level,
-                        "source": record.source,
-                    }
+
+        if client.graph is not None:
+            try:
+                records = client.graph.query(
+                    """
+                    MATCH (o:Occupation)-[r:REQUIRES_SKILL]->(skill:ContentElement)
+                    RETURN o.code AS occupation_code,
+                           skill.element_id AS element_id,
+                           skill.name AS name,
+                           coalesce(skill.description, '') AS description,
+                           toFloat(coalesce(r.importance, 0)) AS importance,
+                           toFloat(coalesce(r.level, 0)) AS level
+                    """
                 )
+                for row in records:
+                    occ_code = row["occupation_code"]
+                    payloads.append(
+                        {
+                            "occupation_code": occ_code,
+                            "soc_prefix": occ_code.split(".")[0],
+                            "element_id": row["element_id"],
+                            "name": row["name"],
+                            "description": row["description"],
+                            "importance": row["importance"],
+                            "level": row["level"],
+                            "source": "graph",
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("Failed to pull skills from Neo4j for vector store: %s", exc)
+
+        if not payloads:
+            client._ensure_local_cache()
+            for occ_code, skills in client._local_skill_records.items():
+                prefix = occ_code.split(".")[0]
+                for record in skills:
+                    payloads.append(
+                        {
+                            "occupation_code": occ_code,
+                            "soc_prefix": prefix,
+                            "element_id": record.element_id,
+                            "name": record.name,
+                            "description": record.description,
+                            "importance": record.importance,
+                            "level": record.level,
+                            "source": record.source,
+                        }
+                    )
 
         if not payloads:
             logger.warning("SkillGraphVectorStore: no payloads to ingest.")
