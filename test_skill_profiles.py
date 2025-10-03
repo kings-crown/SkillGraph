@@ -503,44 +503,43 @@ def _dump_output(result: Dict, *, output_path: Optional[Path]) -> None:
                 f"- Coverage for {role}: {pct:.1f}% ({covered}/{total} skills; "
                 f"importance {coverage.get('covered_importance', 0)}/{coverage.get('total_importance', 0)})"
             )
-<<<<<<< HEAD
             split = coverage.get("split") or {}
             official = split.get("official", {})
             vector = split.get("vector", {})
-            if official:
+            if official.get("total_count"):
+                official_pct = (coverage.get("official_pct") or 0.0) * 100
                 print(
                     "  • Official coverage: {pct:.1f}% ({count}/{total})".format(
-                        pct=(coverage.get("official_pct") or 0.0) * 100,
+                        pct=official_pct,
                         count=official.get("count", 0),
-                        total=vector.get("total_importance") or coverage.get("total_count", 0),
+                        total=official.get("total_count", 0),
                     )
                 )
-            if vector and vector.get("count"):
+            if vector.get("count"):
+                vector_pct = (coverage.get("vector_pct") or 0.0) * 100
                 print(
-                    "  • Vector-assisted coverage: {count} skills (importance {importance})".format(
+                    "  • Vector-assisted coverage: {pct:.1f}% ({count}/{total})".format(
+                        pct=vector_pct,
                         count=vector.get("count", 0),
-                        importance=vector.get("importance", 0),
+                        total=vector.get("total_count", 0),
                     )
                 )
-=======
->>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
+                print(
+                    "    importance {importance}/{total}".format(
+                        importance=vector.get("importance", 0),
+                        total=vector.get("total_importance", 0),
+                    )
+                )
         top_rows = profile.get("skills_covered_table", [])[:5]
         if top_rows:
             print(f"  Top validated skills for {role}:")
             for row in top_rows:
                 print(
-<<<<<<< HEAD
                     "    - {name} (importance {importance}, similarity {similarity}, source {source}, resume '{resume}')".format(
                         name=row["name"],
                         importance=row["importance"],
                         similarity=row["similarity"],
                         source=row.get("match_source", "graph"),
-=======
-                    "    - {name} (importance {importance}, similarity {similarity}, resume '{resume}')".format(
-                        name=row["name"],
-                        importance=row["importance"],
-                        similarity=row["similarity"],
->>>>>>> 1f3f7b3ea5da5d77610711459885eb02bc768a04
                         resume=row["resume_term"] or "-",
                     )
                 )
