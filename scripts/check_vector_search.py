@@ -5,6 +5,10 @@ from __future__ import annotations
 import argparse
 from pprint import pprint
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from neo4jRag import SkillGraphVectorStore
 
 
