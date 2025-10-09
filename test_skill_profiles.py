@@ -59,6 +59,33 @@ except ImportError:  # pragma: no cover - executed only when python-dotenv missi
             return False
 
 
+def _flatten_skill_terms(skills) -> List[str]:
+    """Normalise skill payloads to plain text for prompting/logging."""
+    flattened: List[str] = []
+    seen: set = set()
+    if not skills:
+        return flattened
+    for skill in skills:
+        candidate = None
+        if isinstance(skill, dict):
+            candidate = (
+                skill.get("normalised_term")
+                or skill.get("raw_term")
+                or skill.get("skill")
+                or skill.get("name")
+            )
+        elif isinstance(skill, str):
+            candidate = skill
+        if not candidate:
+            continue
+        text = str(candidate).strip()
+        key = text.lower()
+        if key and key not in seen:
+            seen.add(key)
+            flattened.append(text)
+    return flattened
+
+
 # Ensure repository modules (backend/career_coach, etc.) are importable when the script
 # is executed from within ``SkillGraph``.
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -270,8 +297,8 @@ async def suggest_career_path_with_openai(parsed_resume: Dict) -> Dict:
         {
             "experience": parsed_resume.get("experience"),
             "education": parsed_resume.get("education"),
-            "soft_skills": parsed_resume.get("soft_skills"),
-            "technical_skills": parsed_resume.get("technical_skills"),
+            "soft_skills": _flatten_skill_terms(parsed_resume.get("soft_skills")),
+            "technical_skills": _flatten_skill_terms(parsed_resume.get("technical_skills")),
         },
         indent=2,
     )
@@ -344,8 +371,8 @@ async def skill_analysis_with_openai(
         "resume": {
             "experience": parsed_resume.get("experience"),
             "education": parsed_resume.get("education"),
-            "soft_skills": parsed_resume.get("soft_skills"),
-            "technical_skills": parsed_resume.get("technical_skills"),
+            "soft_skills": _flatten_skill_terms(parsed_resume.get("soft_skills")),
+            "technical_skills": _flatten_skill_terms(parsed_resume.get("technical_skills")),
         },
         "qna": list(qna),
         "username": username,

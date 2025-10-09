@@ -19,6 +19,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -63,6 +64,137 @@ def _load_environment() -> None:
         load_dotenv()
 
 
+def _coerce_skill_terms(skills: Sequence[Any]) -> List[str]:
+    """Normalise mixed skill payloads (strings or dictionaries) into text terms."""
+    terms: List[str] = []
+    seen: set = set()
+    for skill in skills or []:
+        candidate: Optional[str] = None
+        if isinstance(skill, dict):
+            candidate = (
+                skill.get("normalised_term")
+                or skill.get("raw_term")
+                or skill.get("skill")
+                or skill.get("name")
+            )
+        elif isinstance(skill, str):
+            candidate = skill
+        if not candidate:
+            continue
+        cleaned = candidate.strip()
+        key = cleaned.lower()
+        if key and key not in seen:
+            seen.add(key)
+            terms.append(cleaned)
+    return terms
+
+
+@lru_cache(maxsize=1)
+def _load_alias_metadata() -> Dict[str, Dict[str, Any]]:
+    """Load curated alias metadata for enriching vector payloads."""
+    candidates = [
+        Path(__file__).resolve().parents[1] / "backend" / "career_coach" / "resources" / "skills" / "skills.json",
+        Path(__file__).resolve().parent / "resources" / "skills.json",
+    ]
+
+    data: Dict[str, Any] = {}
+    for path in candidates:
+        if path.exists():
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception as exc:
+                logger.debug("Failed to load alias metadata from %s: %s", path, exc)
+                data = {}
+            break
+
+    alias_entries = data.get("aliases", []) if isinstance(data, dict) else []
+    by_element: Dict[Optional[str], Dict[str, Any]] = {}
+    by_canonical: Dict[str, Dict[str, Any]] = {}
+
+    for entry in alias_entries:
+        if not isinstance(entry, dict):
+            continue
+        element_id = entry.get("element_id")
+        canonical = entry.get("canonical_name") or entry.get("name")
+        if element_id:
+            by_element[element_id] = entry
+        if canonical:
+            by_canonical[canonical.lower()] = entry
+
+    return {
+        "by_element": by_element,
+        "by_canonical": by_canonical,
+    }
+
+
+def _apply_alias_metadata(payload: Dict[str, Any], alias_catalog: Dict[str, Dict[str, Any]]) -> None:
+    alias_by_element = alias_catalog.get("by_element", {})
+    alias_by_canonical = alias_catalog.get("by_canonical", {})
+
+    entry: Optional[Dict[str, Any]] = None
+    element_id = payload.get("element_id")
+    name = payload.get("name")
+    if element_id:
+        entry = alias_by_element.get(element_id)
+    if entry is None and name:
+        entry = alias_by_canonical.get(str(name).lower())
+    if not entry:
+        return
+
+    canonical = entry.get("canonical_name") or entry.get("name")
+    if canonical:
+        payload["canonical_name"] = canonical
+    aliases = entry.get("aliases") or []
+    if aliases:
+        payload["aliases"] = list(aliases)
+    abbreviations = entry.get("abbreviations") or []
+    if abbreviations:
+        payload["abbreviations"] = list(abbreviations)
+    tooling = entry.get("tooling") or []
+    if tooling:
+        payload["related_tools"] = list(tooling)
+    notes = entry.get("notes")
+    if notes:
+        payload["alias_notes"] = notes
+
+
+def _skill_record_from_payload(
+    payload: Dict[str, Any],
+    alias_catalog: Dict[str, Dict[str, Any]],
+    *,
+    source: str,
+) -> SkillRecord:
+    enriched = dict(payload)
+    _apply_alias_metadata(enriched, alias_catalog)
+
+    element_id = str(enriched.get("element_id", ""))
+    name = enriched.get("name", element_id)
+    description = enriched.get("description", "")
+    try:
+        importance = float(enriched.get("importance") or 0.0)
+    except (TypeError, ValueError):
+        importance = 0.0
+    try:
+        level = float(enriched.get("level") or 0.0)
+    except (TypeError, ValueError):
+        level = 0.0
+
+    return SkillRecord(
+        element_id=element_id,
+        name=name,
+        description=description,
+        importance=importance,
+        level=level,
+        source=source,
+        canonical_name=enriched.get("canonical_name"),
+        aliases=enriched.get("aliases"),
+        abbreviations=enriched.get("abbreviations"),
+        related_tools=enriched.get("related_tools"),
+        notes=enriched.get("alias_notes"),
+    )
+
+
 @dataclass
 class SkillRecord:
     """Lightweight container for skill descriptors returned from the graph or vector store."""
@@ -73,13 +205,25 @@ class SkillRecord:
     importance: float
     level: float
     source: str = "graph"  # graph | vector
+    canonical_name: Optional[str] = None
+    aliases: Optional[List[str]] = None
+    abbreviations: Optional[List[str]] = None
+    related_tools: Optional[List[str]] = None
+    notes: Optional[str] = None
 
     @property
     def text(self) -> str:
         """Canonical text representation used for embedding comparisons."""
+        parts = [self.name]
         if self.description:
-            return f"{self.name}: {self.description}"
-        return self.name
+            parts.append(self.description)
+        if self.aliases:
+            parts.append("Aliases: " + ", ".join(self.aliases))
+        if self.related_tools:
+            parts.append("Related tools: " + ", ".join(self.related_tools))
+        if self.notes:
+            parts.append(self.notes)
+        return " | ".join(parts)
 
 
 @dataclass
@@ -217,13 +361,18 @@ class SkillGraphClient:
             try:
                 records = self.graph.query(cypher, params)
                 if records:
+                    alias_catalog = _load_alias_metadata()
                     return [
-                        SkillRecord(
-                            element_id=record["element_id"],
-                            name=record["name"],
-                            description=record["description"],
-                            importance=float(record["importance"] or 0.0),
-                            level=float(record["level"] or 0.0),
+                        _skill_record_from_payload(
+                            {
+                                "element_id": record["element_id"],
+                                "name": record["name"],
+                                "description": record["description"],
+                                "importance": record["importance"],
+                                "level": record["level"],
+                            },
+                            alias_catalog,
+                            source="graph",
                         )
                         for record in records
                     ]
@@ -334,6 +483,8 @@ class SkillGraphVectorStore:
         url = getenv("QDRANT_URL")
         api_key = getenv("QDRANT_API_KEY")
 
+        alias_catalog = _load_alias_metadata()
+
         try:
             if url:
                 self._client = QdrantClient(url=url, api_key=api_key)
@@ -400,6 +551,7 @@ class SkillGraphVectorStore:
         client = SkillGraphClient()
 
         payloads: List[Dict[str, Any]] = []
+        alias_catalog = _load_alias_metadata()
 
         if client.graph is not None:
             try:
@@ -416,18 +568,18 @@ class SkillGraphVectorStore:
                 )
                 for row in records:
                     occ_code = row["occupation_code"]
-                    payloads.append(
-                        {
-                            "occupation_code": occ_code,
-                            "soc_prefix": occ_code.split(".")[0],
-                            "element_id": row["element_id"],
-                            "name": row["name"],
-                            "description": row["description"],
-                            "importance": row["importance"],
-                            "level": row["level"],
-                            "source": "graph",
-                        }
-                    )
+                    payload = {
+                        "occupation_code": occ_code,
+                        "soc_prefix": occ_code.split(".")[0],
+                        "element_id": row["element_id"],
+                        "name": row["name"],
+                        "description": row["description"],
+                        "importance": row["importance"],
+                        "level": row["level"],
+                        "source": "graph",
+                    }
+                    _apply_alias_metadata(payload, alias_catalog)
+                    payloads.append(payload)
             except Exception as exc:
                 logger.warning("Failed to pull skills from Neo4j for vector store: %s", exc)
 
@@ -436,24 +588,47 @@ class SkillGraphVectorStore:
             for occ_code, skills in client._local_skill_records.items():
                 prefix = occ_code.split(".")[0]
                 for record in skills:
-                    payloads.append(
-                        {
-                            "occupation_code": occ_code,
-                            "soc_prefix": prefix,
-                            "element_id": record.element_id,
-                            "name": record.name,
-                            "description": record.description,
-                            "importance": record.importance,
-                            "level": record.level,
-                            "source": record.source,
-                        }
-                    )
+                    payload = {
+                        "occupation_code": occ_code,
+                        "soc_prefix": prefix,
+                        "element_id": record.element_id,
+                        "name": record.name,
+                        "description": record.description,
+                        "importance": record.importance,
+                        "level": record.level,
+                        "source": record.source,
+                    }
+                    _apply_alias_metadata(payload, alias_catalog)
+                    payloads.append(payload)
 
         if not payloads:
             logger.warning("SkillGraphVectorStore: no payloads to ingest.")
             return
 
-        texts = [f"{payload['name']}\n{payload['description']}" for payload in payloads]
+        texts: List[str] = []
+        for payload in payloads:
+            alias_fragment = ""
+            aliases = payload.get("aliases") or []
+            if aliases:
+                alias_fragment = "Aliases: " + ", ".join(aliases)
+            abbreviations = payload.get("abbreviations") or []
+            abbreviation_fragment = ""
+            if abbreviations:
+                abbreviation_fragment = "Abbreviations: " + ", ".join(abbreviations)
+            tools = payload.get("related_tools") or []
+            tools_fragment = ""
+            if tools:
+                tools_fragment = "Related tools: " + ", ".join(tools)
+            notes_fragment = payload.get("alias_notes") or ""
+            components = [
+                str(payload.get("name", "")),
+                payload.get("description", ""),
+                alias_fragment,
+                abbreviation_fragment,
+                tools_fragment,
+                notes_fragment,
+            ]
+            texts.append("\n".join(part for part in components if part))
         vectors = self._embed_documents(texts)
 
         points: List[qmodels.PointStruct] = []
@@ -536,26 +711,14 @@ class SkillGraphVectorStore:
             score_threshold=0.0,
         )
         skills: Dict[str, SkillRecord] = {}
+        alias_catalog = _load_alias_metadata()
         for payload in matches:
             element_id = payload.get("element_id")
             if not element_id:
                 continue
-            importance = payload.get("importance") or 0.0
-            try:
-                importance = float(importance)
-            except (TypeError, ValueError):
-                importance = 0.0
-            level = payload.get("level") or 0.0
-            try:
-                level = float(level)
-            except (TypeError, ValueError):
-                level = 0.0
-            record = SkillRecord(
-                element_id=element_id,
-                name=payload.get("name", element_id),
-                description=payload.get("description", ""),
-                importance=importance,
-                level=level,
+            record = _skill_record_from_payload(
+                payload,
+                alias_catalog,
                 source="vector",
             )
             existing = skills.get(element_id)
@@ -733,12 +896,15 @@ class SkillGraphVectorStore:
                             level = float(row.get("level", "") or 0.0)
                         except ValueError:
                             level = 0.0
-                        record = SkillRecord(
-                            element_id=elem_id,
-                            name=content.get("name", elem_id),
-                            description=content.get("description", ""),
-                            importance=importance,
-                            level=level,
+                        record = _skill_record_from_payload(
+                            {
+                                "element_id": elem_id,
+                                "name": content.get("name", elem_id),
+                                "description": content.get("description", ""),
+                                "importance": importance,
+                                "level": level,
+                            },
+                            alias_catalog,
                             source="graph",
                         )
                         cls._local_skill_records.setdefault(occ_code, []).append(record)
@@ -852,6 +1018,10 @@ class SkillGraphVectorStore:
 class SkillMatcher:
     """Embeds and aligns free-form user skills against graph descriptors."""
 
+    SEMANTIC_WEIGHT = 0.6
+    LEXICAL_WEIGHT = 0.3
+    ALIAS_WEIGHT = 0.1
+
     def __init__(self, embedder: Optional[OpenAIEmbeddings] = None) -> None:
         _load_environment()
         self.embedder = embedder or OpenAIEmbeddings(model="text-embedding-3-small")
@@ -859,34 +1029,29 @@ class SkillMatcher:
 
     def match(
         self,
-        user_skill_texts: Sequence[str],
+        user_skill_texts: Sequence[Any],
         graph_skills: Sequence[SkillRecord],
         *,
         similarity_threshold: float = 0.72,
+        lexical_threshold: float = 0.68,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Return skills the user already covers and those likely missing."""
         if not graph_skills:
             return {"matched": [], "missing": []}
 
-        if not user_skill_texts:
+        normalised_user_skills = _coerce_skill_terms(user_skill_texts)
+
+        if not normalised_user_skills:
             missing_payload = [
                 {
                     "skill": skill,
                     "score": None,
                     "matched_user_skill": None,
+                    "score_breakdown": {},
                 }
                 for skill in graph_skills
             ]
             return {"matched": [], "missing": missing_payload}
-
-        # Deduplicate user skill phrases while keeping order
-        seen = set()
-        normalised_user_skills = []
-        for skill_text in user_skill_texts:
-            key = skill_text.strip().lower()
-            if key and key not in seen:
-                normalised_user_skills.append(skill_text.strip())
-                seen.add(key)
 
         user_vectors = self.embedder.embed_documents(normalised_user_skills)
         user_matrix = np.asarray(user_vectors, dtype=np.float32)
@@ -908,20 +1073,58 @@ class SkillMatcher:
 
         matched: List[Dict[str, Any]] = []
         missing: List[Dict[str, Any]] = []
+
         for idx, skill in enumerate(graph_skills):
-            score = float(best_scores[idx])
+            semantic_score = float(best_scores[idx])
             best_user_skill = normalised_user_skills[int(best_user_indices[idx])]
+            lexical_score = self._lexical_similarity(best_user_skill, skill)
+            alias_hit = self._alias_hit(best_user_skill, skill)
+            blended_score = self._blend_scores(semantic_score, lexical_score, alias_hit)
+
+            score_breakdown = {
+                "semantic": round(semantic_score, 3),
+                "lexical": round(lexical_score, 3),
+                "alias": bool(alias_hit),
+                "blended": round(blended_score, 3),
+            }
+
             payload = {
                 "skill": skill,
-                "score": round(score, 3),
+                "score": score_breakdown["blended"],
                 "matched_user_skill": best_user_skill,
                 "match_source": "graph",
+                "score_breakdown": score_breakdown,
+                "semantic_score": score_breakdown["semantic"],
+                "lexical_score": score_breakdown["lexical"],
             }
-            if score >= similarity_threshold:
+
+            if alias_hit or blended_score >= similarity_threshold or lexical_score >= lexical_threshold:
                 matched.append(payload)
             else:
                 payload["matched_user_skill"] = None
                 missing.append(payload)
+
+        matched.sort(key=lambda item: (item["skill"].importance, item["score"]), reverse=True)
+        missing.sort(key=lambda item: item["skill"].importance, reverse=True)
+
+        if matched or missing:
+            metrics = {
+                "matched_count": len(matched),
+                "missing_count": len(missing),
+                "similarity_threshold": similarity_threshold,
+                "lexical_threshold": lexical_threshold,
+                "semantic_avg": round(
+                    float(np.mean([item["score_breakdown"]["semantic"] for item in matched])) if matched else 0.0,
+                    3,
+                ),
+                "blended_avg": round(
+                    float(np.mean([item["score_breakdown"]["blended"] for item in matched])) if matched else 0.0,
+                    3,
+                ),
+            }
+            logger.info("SkillMatcher metrics: %s", metrics)
+
+        return {"matched": matched, "missing": missing}
 
         matched.sort(key=lambda item: (item["skill"].importance, item["score"]), reverse=True)
         missing.sort(key=lambda item: item["skill"].importance, reverse=True)
@@ -936,6 +1139,41 @@ class SkillMatcher:
         vector = np.asarray(embedding, dtype=np.float32)
         self._skill_embedding_cache[skill.element_id] = vector
         return vector
+
+    def _lexical_similarity(self, user_term: str, skill: SkillRecord) -> float:
+        candidates = [skill.name]
+        if skill.canonical_name:
+            candidates.append(skill.canonical_name)
+        if skill.aliases:
+            candidates.extend(skill.aliases)
+        scores = [
+            SequenceMatcher(None, user_term.lower(), candidate.lower()).ratio()
+            for candidate in candidates
+            if candidate
+        ]
+        return max(scores) if scores else 0.0
+
+    def _alias_hit(self, user_term: str, skill: SkillRecord) -> bool:
+        term = user_term.lower()
+        candidates = []
+        if skill.aliases:
+            candidates.extend(alias.lower() for alias in skill.aliases if alias)
+        if skill.abbreviations:
+            candidates.extend(abbrev.lower() for abbrev in skill.abbreviations if abbrev)
+        if skill.canonical_name:
+            candidates.append(skill.canonical_name.lower())
+        candidates.append(skill.name.lower())
+        return term in candidates
+
+    def _blend_scores(self, semantic: float, lexical: float, alias_hit: bool) -> float:
+        weights = self.SEMANTIC_WEIGHT + self.LEXICAL_WEIGHT + self.ALIAS_WEIGHT
+        alias_score = 1.0 if alias_hit else 0.0
+        blended = (
+            semantic * self.SEMANTIC_WEIGHT
+            + lexical * self.LEXICAL_WEIGHT
+            + alias_score * self.ALIAS_WEIGHT
+        )
+        return blended / weights if weights else semantic
 
 
 class SkillGraphCareerPlanner:
@@ -1014,6 +1252,7 @@ class SkillGraphRAG:
         matcher: Optional[SkillMatcher] = None,
         llm: Optional[ChatOpenAI] = None,
         similarity_threshold: float = 0.72,
+        lexical_threshold: float = 0.68,
         vector_store: Optional['SkillGraphVectorStore'] = None,
         vector_similarity_threshold: float = 0.5,
     ) -> None:
@@ -1021,6 +1260,7 @@ class SkillGraphRAG:
         self.graph_client = graph_client or SkillGraphClient()
         self.matcher = matcher or SkillMatcher()
         self.similarity_threshold = similarity_threshold
+        self.lexical_threshold = lexical_threshold
 
         self.vector_store = vector_store or SkillGraphVectorStore()
         if self.vector_store and not self.vector_store.available():
@@ -1039,9 +1279,11 @@ class SkillGraphRAG:
         summarise: bool = True,
     ) -> Dict[str, Any]:
         """Build a structured, graph-grounded skill profile for the user."""
-        technical_skills = parsed_resume.get("technical_skills", [])
-        soft_skills = parsed_resume.get("soft_skills", [])
-        user_skill_texts = [*technical_skills, *soft_skills]
+        technical_skills = _coerce_skill_terms(parsed_resume.get("technical_skills", []))
+        soft_skills = _coerce_skill_terms(parsed_resume.get("soft_skills", []))
+        user_skill_texts = _coerce_skill_terms(
+            list(parsed_resume.get("technical_skills", [])) + list(parsed_resume.get("soft_skills", []))
+        )
 
         role_profiles: List[Dict[str, Any]] = []
         for requested_role in target_roles:
@@ -1066,7 +1308,24 @@ class SkillGraphRAG:
                 vector_skills = self.vector_store.fetch_skills_for_prefix(prefix, top_k=max_skills_per_role)
                 if vector_skills:
                     graph_skills.extend(vector_skills)
-            matching = self.matcher.match(user_skill_texts, graph_skills, similarity_threshold=self.similarity_threshold)
+            matching = self.matcher.match(
+                user_skill_texts,
+                graph_skills,
+                similarity_threshold=self.similarity_threshold,
+                lexical_threshold=self.lexical_threshold,
+            )
+            matched_terms = {
+                item["matched_user_skill"]
+                for item in matching["matched"]
+                if item.get("matched_user_skill")
+            }
+            unmatched_terms = [term for term in user_skill_texts if term not in matched_terms]
+            if unmatched_terms:
+                logger.debug(
+                    "SkillGraphRAG unmatched terms for %s: %s",
+                    requested_role,
+                    unmatched_terms,
+                )
             vector_matches = self._vector_backfill(
                 occ_code,
                 user_skill_texts,
@@ -1075,6 +1334,12 @@ class SkillGraphRAG:
                 max_skills=max_skills_per_role,
             )
             coverage_stats = self._compute_coverage(graph_skills, matching)
+            matcher_metrics = {
+                "matched": len(matching["matched"]),
+                "missing": len(matching["missing"]),
+                "similarity_threshold": self.similarity_threshold,
+                "lexical_threshold": self.lexical_threshold,
+            }
 
             skills_covered_table = [
                 {
@@ -1086,6 +1351,7 @@ class SkillGraphRAG:
                     "resume_term": item["matched_user_skill"],
                     "description": item["skill"].description,
                     "match_source": item.get("match_source", "graph"),
+                    "score_breakdown": item.get("score_breakdown", {}),
                 }
                 for item in matching["matched"]
             ]
@@ -1096,6 +1362,7 @@ class SkillGraphRAG:
                     "importance": round(item["skill"].importance, 3),
                     "level": round(item["skill"].level, 3),
                     "description": item["skill"].description,
+                    "score_breakdown": item.get("score_breakdown", {}),
                 }
                 for item in matching["missing"]
             ]
@@ -1126,6 +1393,8 @@ class SkillGraphRAG:
                     "all_skills_table": all_skills_table,
                     "occupation_context": occupation_context,
                     "vector_matches": vector_matches,
+                    "matcher_metrics": matcher_metrics,
+                    "unmatched_user_skills": unmatched_terms,
                 }
             )
 
@@ -1231,6 +1500,7 @@ class SkillGraphRAG:
         element_map: Dict[str, SkillRecord] = {skill.element_id: skill for skill in graph_skills}
         covered_ids = {item["skill"].element_id for item in matching["matched"]}
         additions: List[Dict[str, Any]] = []
+        alias_catalog = _load_alias_metadata()
 
         for resume_skill in user_skills:
             if not resume_skill:
@@ -1242,32 +1512,30 @@ class SkillGraphRAG:
                 score_threshold=self.vector_similarity_threshold,
             )
             for payload in hits:
-                element_id = payload.get("element_id")
+                metadata = dict(payload)
+                element_id = metadata.get("element_id")
                 if not element_id or element_id in covered_ids:
                     continue
-                importance = payload.get("importance") or 0.0
-                try:
-                    importance = float(importance)
-                except (TypeError, ValueError):
-                    importance = 0.0
-                level = payload.get("level") or 0.0
-                try:
-                    level = float(level)
-                except (TypeError, ValueError):
-                    level = 0.0
+                _apply_alias_metadata(metadata, alias_catalog)
 
                 skill_record = element_map.get(element_id)
                 if skill_record is None:
-                    skill_record = SkillRecord(
-                        element_id=element_id,
-                        name=payload.get("name", element_id),
-                        description=payload.get("description", ""),
-                        importance=importance,
-                        level=level,
+                    skill_record = _skill_record_from_payload(
+                        metadata,
+                        alias_catalog,
                         source="vector",
                     )
                     graph_skills.append(skill_record)
                     element_map[element_id] = skill_record
+                else:
+                    if metadata.get("aliases"):
+                        skill_record.aliases = metadata.get("aliases")
+                    if metadata.get("abbreviations"):
+                        skill_record.abbreviations = metadata.get("abbreviations")
+                    if metadata.get("related_tools"):
+                        skill_record.related_tools = metadata.get("related_tools")
+                    if metadata.get("alias_notes"):
+                        skill_record.notes = metadata.get("alias_notes")
 
                 additions.append(
                     {
