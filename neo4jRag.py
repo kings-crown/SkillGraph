@@ -455,6 +455,109 @@ class SkillGraphClient:
         suggestions.sort(key=lambda item: (item.overlap_score, item.shared_skill_count), reverse=True)
         return suggestions[:limit]
 
+    def occupation_context(
+        self,
+        occupation_code: str,
+        *,
+        top_skills: int = 15,
+        top_activities: int = 8,
+        related_limit: int = 8,
+    ) -> Dict[str, Any]:
+        """Return a structured snapshot of an occupation for grounding LLM responses."""
+
+        context: Dict[str, Any] = {
+            "occupation": None,
+            "skills": [],
+            "activities": [],
+            "related_occupations": [],
+        }
+
+        details = []
+        if self.graph:
+            details_query = (
+                "MATCH (o:Occupation {code: $code})\n"
+                "RETURN o.code AS code, o.title AS title, o.description AS description"
+            )
+            try:
+                details = self.graph.query(details_query, {"code": occupation_code})
+            except Exception as exc:
+                logger.debug("Neo4j occupation context lookup failed: %s", exc)
+
+        if not details:
+            self._ensure_local_cache()
+            local_details = self._local_occupation_map.get(occupation_code)
+            if local_details:
+                context["occupation"] = {"code": occupation_code, **local_details}
+        else:
+            context["occupation"] = details[0]
+
+        skills = []
+        if self.graph:
+            skills_query = (
+                "MATCH (o:Occupation {code: $code})-[r:REQUIRES_SKILL]->(skill:ContentElement)\n"
+                "WHERE 'Skill' IN labels(skill)\n"
+                "RETURN skill.element_id AS element_id, skill.name AS name,\n"
+                "       coalesce(skill.description, '') AS description,\n"
+                "       toFloat(coalesce(r.importance, 0)) AS importance,\n"
+                "       toFloat(coalesce(r.level, 0)) AS level\n"
+                "ORDER BY importance DESC\n"
+                "LIMIT toInteger($limit)"
+            )
+            try:
+                skills = self.graph.query(
+                    skills_query,
+                    {"code": occupation_code, "limit": top_skills},
+                )
+            except Exception as exc:
+                logger.debug("Neo4j occupation skills context failed: %s", exc)
+        if not skills:
+            self._ensure_local_cache()
+            skills = [
+                {
+                    "element_id": record.element_id,
+                    "name": record.name,
+                    "description": record.description,
+                    "importance": record.importance,
+                    "level": record.level,
+                }
+                for record in self._local_skill_records.get(occupation_code, [])[:top_skills]
+            ]
+        context["skills"] = skills
+
+        activities = []
+        if self.graph:
+            activities_query = (
+                "MATCH (o:Occupation {code: $code})-[r:INVOLVES_ACTIVITY]->(activity:ContentElement)\n"
+                "RETURN activity.element_id AS element_id, activity.name AS name,\n"
+                "       coalesce(activity.description, '') AS description,\n"
+                "       toFloat(coalesce(r.importance, 0)) AS importance\n"
+                "ORDER BY importance DESC\n"
+                "LIMIT toInteger($limit)"
+            )
+            try:
+                activities = self.graph.query(
+                    activities_query,
+                    {"code": occupation_code, "limit": top_activities},
+                )
+            except Exception as exc:
+                logger.debug("Neo4j activities context failed: %s", exc)
+        if not activities:
+            self._ensure_local_cache()
+            activities = self._local_activity_records.get(occupation_code, [])[:top_activities]
+        context["activities"] = activities
+
+        context["related_occupations"] = [
+            {
+                "code": suggestion.code,
+                "title": suggestion.title,
+                "overlap_score": suggestion.overlap_score,
+                "shared_skill_count": suggestion.shared_skill_count,
+            }
+            for suggestion in self.related_occupations_by_skill(occupation_code, limit=related_limit)
+        ]
+
+        return context
+
 
 class SkillGraphVectorStore:
     """Vector search helper backed by Qdrant for semantic skill matching."""
@@ -725,109 +828,6 @@ class SkillGraphVectorStore:
             if existing is None or record.importance > existing.importance:
                 skills[element_id] = record
         return sorted(skills.values(), key=lambda rec: rec.importance, reverse=True)
-    def occupation_context(
-        self,
-        occupation_code: str,
-        *,
-        top_skills: int = 15,
-        top_activities: int = 8,
-        related_limit: int = 8,
-    ) -> Dict[str, Any]:
-        """Return a structured snapshot of an occupation for grounding LLM responses."""
-
-        context: Dict[str, Any] = {
-            "occupation": None,
-            "skills": [],
-            "activities": [],
-            "related_occupations": [],
-        }
-
-        details = []
-        if self.graph:
-            details_query = (
-                "MATCH (o:Occupation {code: $code})\n"
-                "RETURN o.code AS code, o.title AS title, o.description AS description"
-            )
-            try:
-                details = self.graph.query(details_query, {"code": occupation_code})
-            except Exception as exc:
-                logger.debug("Neo4j occupation context lookup failed: %s", exc)
-
-        if not details:
-            self._ensure_local_cache()
-            local_details = self._local_occupation_map.get(occupation_code)
-            if local_details:
-                context["occupation"] = {"code": occupation_code, **local_details}
-        else:
-            context["occupation"] = details[0]
-
-        skills = []
-        if self.graph:
-            skills_query = (
-                "MATCH (o:Occupation {code: $code})-[r:REQUIRES_SKILL]->(skill:ContentElement)\n"
-                "WHERE 'Skill' IN labels(skill)\n"
-                "RETURN skill.element_id AS element_id, skill.name AS name,\n"
-                "       coalesce(skill.description, '') AS description,\n"
-                "       toFloat(coalesce(r.importance, 0)) AS importance,\n"
-                "       toFloat(coalesce(r.level, 0)) AS level\n"
-                "ORDER BY importance DESC\n"
-                "LIMIT toInteger($limit)"
-            )
-            try:
-                skills = self.graph.query(
-                    skills_query,
-                    {"code": occupation_code, "limit": top_skills},
-                )
-            except Exception as exc:
-                logger.debug("Neo4j occupation skills context failed: %s", exc)
-        if not skills:
-            self._ensure_local_cache()
-            skills = [
-                {
-                    "element_id": record.element_id,
-                    "name": record.name,
-                    "description": record.description,
-                    "importance": record.importance,
-                    "level": record.level,
-                }
-                for record in self._local_skill_records.get(occupation_code, [])[:top_skills]
-            ]
-        context["skills"] = skills
-
-        activities = []
-        if self.graph:
-            activities_query = (
-                "MATCH (o:Occupation {code: $code})-[r:INVOLVES_ACTIVITY]->(activity:ContentElement)\n"
-                "RETURN activity.element_id AS element_id, activity.name AS name,\n"
-                "       coalesce(activity.description, '') AS description,\n"
-                "       toFloat(coalesce(r.importance, 0)) AS importance\n"
-                "ORDER BY importance DESC\n"
-                "LIMIT toInteger($limit)"
-            )
-            try:
-                activities = self.graph.query(
-                    activities_query,
-                    {"code": occupation_code, "limit": top_activities},
-                )
-            except Exception as exc:
-                logger.debug("Neo4j activities context failed: %s", exc)
-        if not activities:
-            self._ensure_local_cache()
-            activities = self._local_activity_records.get(occupation_code, [])[:top_activities]
-        context["activities"] = activities
-
-        context["related_occupations"] = [
-            {
-                "code": suggestion.code,
-                "title": suggestion.title,
-                "overlap_score": suggestion.overlap_score,
-                "shared_skill_count": suggestion.shared_skill_count,
-            }
-            for suggestion in self.related_occupations_by_skill(occupation_code, limit=related_limit)
-        ]
-
-        return context
-
     # ------------------------------------------------------------------
     # Local CSV helpers
     # ------------------------------------------------------------------
@@ -837,6 +837,7 @@ class SkillGraphVectorStore:
         if cls._local_loaded:
             return
 
+        alias_catalog = _load_alias_metadata()
         base_dir = Path(__file__).resolve().parent / "neo4j_csv"
         nodes_dir = base_dir / "nodes"
         rel_dir = base_dir / "relationships"
@@ -1015,6 +1016,195 @@ class SkillGraphVectorStore:
         ]
 
 
+def _skillgraphclient_ensure_local_cache(self: SkillGraphClient) -> None:
+    cls = type(self)
+    if cls._local_loaded:
+        return
+
+    alias_catalog = _load_alias_metadata()
+    base_dir = Path(__file__).resolve().parent / "neo4j_csv"
+    nodes_dir = base_dir / "nodes"
+    rel_dir = base_dir / "relationships"
+    occupations_path = nodes_dir / "occupations.csv"
+    content_path = nodes_dir / "content_elements.csv"
+    occ_skill_path = rel_dir / "occupation_requires_skill.csv"
+    occ_activity_path = rel_dir / "occupation_involves_activity.csv"
+
+    if not nodes_dir.exists() or not rel_dir.exists():
+        logger.debug("Local Neo4j CSV directory missing at %s", base_dir)
+        cls._local_loaded = True
+        return
+
+    try:
+        if occupations_path.exists():
+            with occupations_path.open(encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    code = row.get("code:ID(Occupation)")
+                    if not code:
+                        continue
+                    cls._local_occupation_map[code] = {
+                        "title": row.get("title", ""),
+                        "description": row.get("description", ""),
+                    }
+
+        if content_path.exists():
+            with content_path.open(encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    element_id = row.get("element_id:ID(ContentElement)")
+                    if not element_id:
+                        continue
+                    cls._local_content_map[element_id] = {
+                        "name": row.get("name", ""),
+                        "description": row.get("description", ""),
+                        "labels": row.get("labels:LABEL", ""),
+                    }
+
+        if occ_skill_path.exists():
+            with occ_skill_path.open(encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    occ_code = row.get("start:START_ID(Occupation)")
+                    elem_id = row.get("end:END_ID(ContentElement)")
+                    if not occ_code or not elem_id:
+                        continue
+                    content = cls._local_content_map.get(elem_id, {})
+                    labels = content.get("labels", "")
+                    if "Skill" not in labels:
+                        continue
+                    try:
+                        importance = float(row.get("importance", "") or 0.0)
+                    except ValueError:
+                        importance = 0.0
+                    try:
+                        level = float(row.get("level", "") or 0.0)
+                    except ValueError:
+                        level = 0.0
+                    record = _skill_record_from_payload(
+                        {
+                            "element_id": elem_id,
+                            "name": content.get("name", elem_id),
+                            "description": content.get("description", ""),
+                            "importance": importance,
+                            "level": level,
+                        },
+                        alias_catalog,
+                        source="graph",
+                    )
+                    cls._local_skill_records.setdefault(occ_code, []).append(record)
+                    cls._local_skill_importance.setdefault(occ_code, {})[elem_id] = importance
+
+            for records in cls._local_skill_records.values():
+                records.sort(key=lambda rec: rec.importance, reverse=True)
+
+        if occ_activity_path.exists():
+            with occ_activity_path.open(encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    occ_code = row.get("start:START_ID(Occupation)")
+                    elem_id = row.get("end:END_ID(ContentElement)")
+                    if not occ_code or not elem_id:
+                        continue
+                    content = cls._local_content_map.get(elem_id, {})
+                    try:
+                        importance = float(row.get("importance", "") or 0.0)
+                    except ValueError:
+                        importance = 0.0
+                    record = {
+                        "element_id": elem_id,
+                        "name": content.get("name", elem_id),
+                        "description": content.get("description", ""),
+                        "importance": importance,
+                    }
+                    cls._local_activity_records.setdefault(occ_code, []).append(record)
+
+            for records in cls._local_activity_records.values():
+                records.sort(key=lambda rec: rec.get("importance", 0.0), reverse=True)
+
+    except Exception as exc:
+        logger.debug("Failed to load local SkillGraph CSV cache: %s", exc)
+    finally:
+        cls._local_loaded = True
+
+    variant_groups: Dict[str, List[str]] = {}
+    for code in cls._local_skill_records.keys():
+        if "." in code:
+            prefix = code.split(".")[0]
+            variant_groups.setdefault(prefix, []).append(code)
+
+    for prefix, codes in variant_groups.items():
+        base_code = f"{prefix}.00"
+        if base_code in cls._local_skill_records or base_code not in cls._local_occupation_map:
+            continue
+
+        aggregated: Dict[str, SkillRecord] = {}
+        for variant_code in codes:
+            for record in cls._local_skill_records.get(variant_code, []):
+                existing = aggregated.get(record.element_id)
+                if existing is None or record.importance > existing.importance:
+                    aggregated[record.element_id] = record
+
+        if not aggregated:
+            continue
+
+        ordered = sorted(aggregated.values(), key=lambda rec: rec.importance, reverse=True)
+        cls._local_skill_records[base_code] = ordered
+        cls._local_skill_importance[base_code] = {
+            record.element_id: record.importance for record in ordered
+        }
+
+        activity_records: List[Dict[str, Any]] = []
+        for variant_code in codes:
+            for record in cls._local_activity_records.get(variant_code, []):
+                element_id = record.get("element_id")
+                if not element_id:
+                    continue
+                existing = next((item for item in activity_records if item.get("element_id") == element_id), None)
+                if existing is None or record.get("importance", 0.0) > existing.get("importance", 0.0):
+                    if existing is not None:
+                        activity_records.remove(existing)
+                    activity_records.append(record)
+
+        activity_records.sort(key=lambda rec: rec.get("importance", 0.0), reverse=True)
+        cls._local_activity_records[base_code] = activity_records
+
+
+def _skillgraphclient_local_resolve(self: SkillGraphClient, candidate_title: str, limit: int) -> List[Dict[str, Any]]:
+    _skillgraphclient_ensure_local_cache(self)
+    cls = type(self)
+    results: List[Dict[str, Any]] = []
+    candidate_lower = candidate_title.lower()
+    for code, data in cls._local_occupation_map.items():
+        title = data.get("title", "")
+        if not title:
+            continue
+        if candidate_lower in title.lower() or title.lower() in candidate_lower:
+            results.append({"code": code, **data})
+    if results:
+        return results[:limit]
+
+    scored: List[Tuple[float, str, Dict[str, str]]] = []
+    for code, data in cls._local_occupation_map.items():
+        title = data.get("title", "")
+        if not title:
+            continue
+        ratio = SequenceMatcher(None, candidate_lower, title.lower()).ratio()
+        scored.append((ratio, code, data))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {"code": code, **data}
+        for ratio, code, data in scored[: min(limit * 5, len(scored))]
+    ]
+
+
+if not hasattr(SkillGraphClient, "_ensure_local_cache"):
+    SkillGraphClient._ensure_local_cache = _skillgraphclient_ensure_local_cache
+
+if not hasattr(SkillGraphClient, "_local_resolve"):
+    SkillGraphClient._local_resolve = _skillgraphclient_local_resolve
+
+
 class SkillMatcher:
     """Embeds and aligns free-form user skills against graph descriptors."""
 
@@ -1032,8 +1222,8 @@ class SkillMatcher:
         user_skill_texts: Sequence[Any],
         graph_skills: Sequence[SkillRecord],
         *,
-        similarity_threshold: float = 0.72,
-        lexical_threshold: float = 0.68,
+        similarity_threshold: float = 0.30,
+        lexical_threshold: float = 0.30,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Return skills the user already covers and those likely missing."""
         if not graph_skills:
