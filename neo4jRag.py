@@ -1457,7 +1457,7 @@ class SkillGraphRAG:
             self.vector_store = None
         self.vector_similarity_threshold = vector_similarity_threshold
 
-        self.llm = llm or ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+        self.llm = llm or ChatOpenAI(model="gpt-5-mini-2025-08-07", temperature=0.1)
 
     def generate_skill_profile(
         self,
@@ -1471,8 +1471,11 @@ class SkillGraphRAG:
         """Build a structured, graph-grounded skill profile for the user."""
         technical_skills = _coerce_skill_terms(parsed_resume.get("technical_skills", []))
         soft_skills = _coerce_skill_terms(parsed_resume.get("soft_skills", []))
+        top_skills = _coerce_skill_terms(parsed_resume.get("Top_10_Skills", []))
         user_skill_texts = _coerce_skill_terms(
-            list(parsed_resume.get("technical_skills", [])) + list(parsed_resume.get("soft_skills", []))
+            list(parsed_resume.get("technical_skills", []))
+            + list(parsed_resume.get("soft_skills", []))
+            + list(parsed_resume.get("Top_10_Skills", []))
         )
 
         role_profiles: List[Dict[str, Any]] = []
