@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
 import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from openai import AsyncOpenAI
 
@@ -96,6 +97,7 @@ if BACKEND_DIR.exists():
 from career_coach.career_path import CareerPath
 from career_coach.resume_parser import ResumeParser, SaveResumeToDisk
 from career_coach.skill_analysis import SkillAnalysis
+from career_coach.utils.skill_normaliser import SkillNormaliser
 
 try:
     from SkillGraph.neo4jRag import SkillGraphRAG, SkillRecord
@@ -125,35 +127,165 @@ def extract_pdf_text(pdf_path: Path) -> str:
     return SaveResumeToDisk.retrieve_resume(str(pdf_path))
 
 
+_SKILL_NORMALISER = SkillNormaliser()
+
+
+def _collect_skill_contexts(parsed_resume: Dict) -> List[str]:
+    """Collect textual snippets that give provenance for skill mentions."""
+    contexts: List[str] = []
+    for entry in parsed_resume.get("experience", []):
+        if not isinstance(entry, dict):
+            continue
+        snippets = [
+            entry.get("job_title", ""),
+            entry.get("company", ""),
+            entry.get("details", ""),
+        ]
+        context = " | ".join(part for part in snippets if part)
+        if context:
+            contexts.append(context)
+    for entry in parsed_resume.get("education", []):
+        if not isinstance(entry, dict):
+            continue
+        snippets = [
+            entry.get("degree", ""),
+            entry.get("institution", ""),
+            entry.get("year", ""),
+        ]
+        context = " | ".join(part for part in snippets if part)
+        if context:
+            contexts.append(context)
+    return contexts
+
+
+def _normalise_parsed_skills(parsed_resume: Dict) -> None:
+    """Ensure skill lists are tagged and canonicalised against the alias catalog."""
+    contexts = _collect_skill_contexts(parsed_resume)
+
+    def _normalise_field(field: str) -> None:
+        raw = parsed_resume.get(field) or []
+        # Avoid double-normalising if the backend already produced structured objects.
+        if raw and isinstance(raw[0], dict) and "normalised_term" in raw[0]:
+            return
+        parsed_resume[field] = _SKILL_NORMALISER.normalise_skill_list(
+            raw,
+            source_section=field,
+            contexts=contexts,
+        )
+
+    for field in ("technical_skills", "soft_skills"):
+        _normalise_field(field)
+
+    top_skills = parsed_resume.get("Top_10_Skills") or []
+    if top_skills:
+        enriched: List[Dict[str, object]] = []
+        for entry in top_skills:
+            if not isinstance(entry, dict):
+                continue
+            normalised = _SKILL_NORMALISER.normalise_skill(
+                entry.get("skill", ""),
+                source_section="top_10_skills",
+            )
+            updated = dict(entry)
+            if normalised:
+                updated["normalised_term"] = normalised["normalised_term"]
+                updated["confidence"] = normalised["confidence"]
+                if normalised.get("element_id"):
+                    updated["element_id"] = normalised["element_id"]
+                if normalised.get("aliases"):
+                    updated["aliases"] = normalised["aliases"]
+                if normalised.get("related_tools"):
+                    updated["related_tools"] = normalised["related_tools"]
+            enriched.append(updated)
+        parsed_resume["Top_10_Skills"] = enriched
+
+
+def _merge_unique_list(
+    existing: Optional[List[Any]],
+    incoming: Optional[List[Any]],
+) -> List[Any]:
+    result: List[Any] = []
+    seen: set[str] = set()
+    for collection in (existing or []), (incoming or []):
+        for item in collection:
+            if isinstance(item, dict):
+                key = item.get("skill") or item.get("normalised_term") or json.dumps(item, sort_keys=True)
+            else:
+                key = str(item).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _merge_parsed_runs(parsed_runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not parsed_runs:
+        return {}
+    merged = copy.deepcopy(parsed_runs[0])
+    for run in parsed_runs[1:]:
+        for field in ("technical_skills", "soft_skills"):
+            merged[field] = _merge_unique_list(merged.get(field), run.get(field))
+        merged["Top_10_Skills"] = _merge_unique_list(merged.get("Top_10_Skills"), run.get("Top_10_Skills"))
+    return merged
+
+
 async def parse_resume(pdf_text: str) -> Dict:
     """Parse resume text into structured fields using the existing parser."""
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     if azure_endpoint:
         logger.info("Parsing resume via Azure OpenAI helper …")
         parser = ResumeParser()
-        username, parsed_resume = await parser.resume_parse(pdf_text)
-        logger.info("Parsed resume for user: %s", username or "(unknown)")
-        parsed_resume["username"] = username
-        return parsed_resume
+        runs = max(1, int(os.getenv("RESUME_PARSER_RUNS", "1")))
+        parsed_runs: List[Dict[str, Any]] = []
+        username = None
+        for _ in range(runs):
+            username, parsed_resume = await parser.resume_parse(pdf_text)
+            parsed_runs.append(parsed_resume)
+        merged = _merge_parsed_runs(parsed_runs)
+        logger.info("Parsed resume for user: %s", username or merged.get("name") or "(unknown)")
+        merged["username"] = username or merged.get("name")
+        _normalise_parsed_skills(merged)
+        if not merged.get("technical_skills"):
+            logger.warning("Parsed resume contains no technical skills; downstream matching may be sparse.")
+        if not merged.get("soft_skills"):
+            logger.warning(
+                "Parsed resume contains no soft skills; consider reviewing the parsing prompt or cached result."
+            )
+        return merged
 
     logger.info("Parsing resume via standard OpenAI helper …")
-    parsed_resume = await parse_resume_with_openai(pdf_text)
-    username = parsed_resume.get("name")
-    parsed_resume["username"] = username
+    runs = max(1, int(os.getenv("RESUME_PARSER_RUNS", "1")))
+    parsed_runs: List[Dict[str, Any]] = []
+    for _ in range(runs):
+        parsed_runs.append(await parse_resume_with_openai(pdf_text))
+    merged = _merge_parsed_runs(parsed_runs)
+    username = merged.get("name")
+    merged["username"] = username
     logger.info("Parsed resume for user: %s", username or "(unknown)")
-    return parsed_resume
+    _normalise_parsed_skills(merged)
+    if not merged.get("technical_skills"):
+        logger.warning("Parsed resume contains no technical skills; downstream matching may be sparse.")
+    if not merged.get("soft_skills"):
+        logger.warning(
+            "Parsed resume contains no soft skills; consider reviewing the parsing prompt or cached result."
+        )
+    return merged
 
 
 async def parse_resume_with_openai(pdf_text: str) -> Dict:
     """Fallback resume parser that uses OpenAI's public API instead of Azure."""
     client = AsyncOpenAI()
-    model = os.getenv("OPENAI_RESUME_MODEL", "gpt-4o-mini")
+    model = os.getenv("OPENAI_RESUME_MODEL", "gpt-5-mini-2025-08-07")
 
     system_prompt = (
         "You are a resume parser. Extract relevant details from resumes into a comprehensive and "
-        "structured JSON format. Ensure no information is missed. If any field is too long, summarize "
+        "structured JSON format. Ensure no information is missed. If any field is too long, summarise "
         "the information appropriately. Provide detailed output for each section such as name, phone, "
-        "email, education, experience, technical skills, soft skills, and LinkedIn."
+        "email, education, experience, technical skills, soft skills, and LinkedIn. When listing skills, "
+        "prefer canonical O*NET-style names (e.g., 'Critical Thinking', 'Complex Problem Solving'). "
+        "Return skills as title-cased noun phrases. Do not invent synonyms; if a skill cannot be mapped "
+        "confidently to a canonical label, omit it instead of paraphrasing."
     )
 
     tools = [
@@ -286,7 +418,7 @@ async def generate_skill_analysis(parsed_resume: Dict, qna: Sequence[Dict]) -> D
 async def suggest_career_path_with_openai(parsed_resume: Dict) -> Dict:
     """Fallback generator for the career path suggestions."""
     client = AsyncOpenAI()
-    model = os.getenv("OPENAI_CAREER_MODEL", "gpt-4o-mini")
+    model = os.getenv("OPENAI_CAREER_MODEL", "gpt-5-mini-2025-08-07")
 
     system_prompt = (
         "You are an expert in career progression analysis. Evaluate the candidate's resume and identify "
@@ -359,7 +491,7 @@ async def skill_analysis_with_openai(
 ) -> str:
     """Generate the skill analysis narrative using OpenAI instead of Azure."""
     client = AsyncOpenAI()
-    model = os.getenv("OPENAI_SKILL_MODEL", "gpt-4o-mini")
+    model = os.getenv("OPENAI_SKILL_MODEL", "gpt-5-mini-2025-08-07")
 
     system_prompt = (
         "You are a career coach specialising in skill assessment. Ground your analysis in the provided "
