@@ -565,6 +565,10 @@ def _serialise_rag_profiles(raw_profiles: Sequence[Dict]) -> List[Dict]:
                 "skills_covered_table": profile.get("skills_covered_table", []),
                 "skill_gaps_table": profile.get("skill_gaps_table", []),
                 "all_skills_table": profile.get("all_skills_table", []),
+                "vector_matches": profile.get("vector_matches", []),
+                "matcher_metrics": profile.get("matcher_metrics"),
+                "unmatched_user_skills": profile.get("unmatched_user_skills", []),
+                "related_major_group": profile.get("related_major_group", []),
             }
         )
     return serialised

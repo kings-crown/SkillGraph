@@ -53,6 +53,15 @@ except ImportError:  # pragma: no cover - keep runtime optional
 
 logger = logging.getLogger(__name__)
 
+def _soc_major_prefix(code: str) -> Optional[str]:
+    """Return the major SOC prefix (e.g. ``15-``) for a full occupation code."""
+    if not code or "-" not in code:
+        return None
+    major = code.split("-", 1)[0]
+    if not major:
+        return None
+    return f"{major}-"
+
 
 def _load_environment() -> None:
     """Load Neo4j/OpenAI environment variables from `.env` if present."""
@@ -390,6 +399,7 @@ class SkillGraphClient:
         occupation_code: str,
         *,
         limit: int = 10,
+        restrict_prefix: Optional[str] = None,
     ) -> List[OccupationSuggestion]:
         """Return occupations that share overlapping skills with the given occupation."""
 
@@ -398,7 +408,9 @@ class SkillGraphClient:
                 "MATCH (current:Occupation {code: $code})-[r:REQUIRES_SKILL]->(skill:ContentElement)\n"
                 "MATCH (other:Occupation)-[r2:REQUIRES_SKILL]->(skill)\n"
                 "WHERE other <> current\n"
-                "WITH other, sum(coalesce(r.importance, 0) * coalesce(r2.importance, 0)) AS weighted_overlap,\n"
+                "  AND ($prefix IS NULL OR other.code STARTS WITH $prefix)\n"
+                "WITH other,\n"
+                "     sum(toFloat(coalesce(r.importance, 0)) * toFloat(coalesce(r2.importance, 0))) AS weighted_overlap,\n"
                 "     count(skill) AS shared_skill_count\n"
                 "RETURN other.code AS code,\n"
                 "       other.title AS title,\n"
@@ -409,7 +421,10 @@ class SkillGraphClient:
             )
 
             try:
-                records = self.graph.query(cypher, {"code": occupation_code, "limit": limit})
+                records = self.graph.query(
+                    cypher,
+                    {"code": occupation_code, "limit": limit, "prefix": restrict_prefix},
+                )
                 if records:
                     suggestions: List[OccupationSuggestion] = []
                     for record in records:
@@ -430,9 +445,12 @@ class SkillGraphClient:
         if not base:
             return []
 
+        prefix = restrict_prefix
         suggestions: List[OccupationSuggestion] = []
         for other_code, importance_map in self._local_skill_importance.items():
             if other_code == occupation_code:
+                continue
+            if prefix and not other_code.startswith(prefix):
                 continue
             overlap = 0.0
             shared = 0
@@ -546,6 +564,14 @@ class SkillGraphClient:
             activities = self._local_activity_records.get(occupation_code, [])[:top_activities]
         context["activities"] = activities
 
+        related_any = self.related_occupations_by_skill(occupation_code, limit=related_limit)
+        major_prefix = _soc_major_prefix(occupation_code)
+        related_major = self.related_occupations_by_skill(
+            occupation_code,
+            limit=related_limit,
+            restrict_prefix=major_prefix,
+        )
+
         context["related_occupations"] = [
             {
                 "code": suggestion.code,
@@ -553,7 +579,16 @@ class SkillGraphClient:
                 "overlap_score": suggestion.overlap_score,
                 "shared_skill_count": suggestion.shared_skill_count,
             }
-            for suggestion in self.related_occupations_by_skill(occupation_code, limit=related_limit)
+            for suggestion in related_any
+        ]
+        context["related_major_group_occupations"] = [
+            {
+                "code": suggestion.code,
+                "title": suggestion.title,
+                "overlap_score": suggestion.overlap_score,
+                "shared_skill_count": suggestion.shared_skill_count,
+            }
+            for suggestion in related_major
         ]
 
         return context
@@ -1478,8 +1513,14 @@ class SkillGraphRAG:
             + list(parsed_resume.get("Top_10_Skills", []))
         )
 
+        candidate_roles: List[str] = []
+        if target_roles:
+            candidate_roles = [role for role in target_roles if role]
+        if not candidate_roles:
+            candidate_roles = self._auto_target_roles(parsed_resume, limit=3)
+
         role_profiles: List[Dict[str, Any]] = []
-        for requested_role in target_roles:
+        for requested_role in candidate_roles:
             occupation_matches = self.graph_client.resolve_occupation(requested_role, limit=3)
             if not occupation_matches:
                 role_profiles.append(
@@ -1495,18 +1536,58 @@ class SkillGraphRAG:
 
             best_match = occupation_matches[0]
             occ_code = best_match["code"]
+            if isinstance(occ_code, str) and occ_code.endswith(".00"):
+                aggregate_match = best_match
+                detailed_match: Optional[Dict[str, Any]] = None
+                major_prefix = _soc_major_prefix(occ_code)
+                try:
+                    candidates = self.graph_client.related_occupations_by_skill(
+                        occ_code,
+                        limit=10,
+                        restrict_prefix=major_prefix,
+                    )
+                except Exception as exc:
+                    logger.debug("Occupation fallback lookup failed for %s: %s", occ_code, exc)
+                    candidates = []
+                for candidate in candidates:
+                    code = getattr(candidate, "code", None)
+                    if code and not code.endswith(".00"):
+                        detail = self.graph_client.resolve_occupation(code, limit=1)
+                        if detail:
+                            detailed_match = detail[0]
+                        break
+                if detailed_match:
+                    occ_code = detailed_match["code"]
+                    best_match = detailed_match
+                    reordered: List[Dict[str, Any]] = [detailed_match]
+                    reordered.extend(
+                        match for match in occupation_matches if match["code"] not in {occ_code, aggregate_match["code"]}
+                    )
+                    if aggregate_match["code"] != occ_code:
+                        reordered.append(aggregate_match)
+                    occupation_matches = reordered
+
             graph_skills = self.graph_client.occupation_skills(occ_code, limit=max_skills_per_role)
             if not graph_skills and self.vector_store:
                 prefix = occ_code.split(".")[0]
                 vector_skills = self.vector_store.fetch_skills_for_prefix(prefix, top_k=max_skills_per_role)
                 if vector_skills:
                     graph_skills.extend(vector_skills)
-            matching = self.matcher.match(
+
+            lexical_seed_matches, residual_skills = self._initial_lexical_matches(
                 user_skill_texts,
                 graph_skills,
+                lexical_threshold=self.lexical_threshold,
+            )
+
+            matching = self.matcher.match(
+                user_skill_texts,
+                residual_skills,
                 similarity_threshold=self.similarity_threshold,
                 lexical_threshold=self.lexical_threshold,
             )
+            if lexical_seed_matches:
+                matching["matched"].extend(lexical_seed_matches)
             matched_terms = {
                 item["matched_user_skill"]
                 for item in matching["matched"]
@@ -1571,6 +1652,7 @@ class SkillGraphRAG:
             ]
 
             occupation_context = self.graph_client.occupation_context(occ_code)
+            related_major_group = occupation_context.get("related_major_group_occupations", [])
 
             role_profiles.append(
                 {
@@ -1588,6 +1670,7 @@ class SkillGraphRAG:
                     "vector_matches": vector_matches,
                     "matcher_metrics": matcher_metrics,
                     "unmatched_user_skills": unmatched_terms,
+                    "related_major_group": related_major_group,
                 }
             )
 
@@ -1600,6 +1683,83 @@ class SkillGraphRAG:
             "profiles": role_profiles,
             "analysis": analysis,
         }
+
+    def _auto_target_roles(self, parsed_resume: Dict[str, Any], *, limit: int = 3) -> List[str]:
+        titles: List[str] = []
+        experience = parsed_resume.get("experience")
+        if isinstance(experience, list):
+            for entry in experience:
+                if isinstance(entry, dict):
+                    title = entry.get("job_title") or entry.get("title")
+                    if isinstance(title, str):
+                        cleaned = title.strip()
+                        if cleaned:
+                            titles.append(cleaned)
+        current_role = parsed_resume.get("current_position") or parsed_resume.get("current_role")
+        if not titles and isinstance(current_role, str) and current_role.strip():
+            titles.append(current_role.strip())
+
+        suggestions: List[str] = []
+        seen_codes: set[str] = set()
+        for title in titles:
+            try:
+                matches = self.graph_client.resolve_occupation(title, limit=1)
+            except Exception as exc:
+                logger.debug("Auto role resolution failed for '%s': %s", title, exc)
+                continue
+            if not matches:
+                continue
+            match = matches[0]
+            code = match.get("code")
+            display = match.get("title") or title
+            if code:
+                if code in seen_codes:
+                    continue
+                seen_codes.add(code)
+            if display:
+                suggestions.append(display)
+            if len(suggestions) >= limit:
+                break
+        return suggestions[:limit]
+
+    def _initial_lexical_matches(
+        self,
+        user_skill_texts: Sequence[str],
+        graph_skills: Sequence[SkillRecord],
+        *,
+        lexical_threshold: float,
+    ) -> Tuple[List[Dict[str, Any]], List[SkillRecord]]:
+        lexical_hits: List[Dict[str, Any]] = []
+        remaining: List[SkillRecord] = []
+        for skill in graph_skills:
+            best_term: Optional[str] = None
+            best_score = 0.0
+            for term in user_skill_texts:
+                score = self.matcher._lexical_similarity(term, skill)
+                if score > best_score:
+                    best_score = score
+                    best_term = term
+            if best_term and best_score >= lexical_threshold:
+                rounded = round(best_score, 3)
+                lexical_hits.append(
+                    {
+                        "skill": skill,
+                        "score": rounded,
+                        "matched_user_skill": best_term,
+                        "match_source": "lexical",
+                        "score_breakdown": {
+                            "semantic": 0.0,
+                            "lexical": rounded,
+                            "alias": False,
+                            "blended": rounded,
+                        },
+                        "semantic_score": 0.0,
+                        "lexical_score": rounded,
+                    }
+                )
+            else:
+                remaining.append(skill)
+        return lexical_hits, remaining
 
     # ------------------------------------------------------------------
     def _compute_coverage(
