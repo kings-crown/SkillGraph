@@ -4,5 +4,7 @@ neo4j_csv
 __pycache__/
 onet_dump.zip
 .env
-
+*.csv
+*.xlsx
+*.txt
 qdrant_storage/

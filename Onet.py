@@ -20,7 +20,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -161,6 +161,17 @@ def _sanitize_scale_property(scale_id: str, used: set[str]) -> str:
         counter += 1
     used.add(candidate)
     return candidate
+
+
+def _normalize_flag(series: pd.Series) -> pd.Series:
+    """Convert Y/N style flags into booleans while preserving missing entries."""
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.upper()
+        .map({"Y": True, "N": False})
+        .where(series.notna(), None)
+    )
 
 
 def load_excel_table(path: Path, columns: Optional[Iterable[str]] = None) -> pd.DataFrame:
@@ -522,6 +533,413 @@ def emit_importer_ready_assets(out_dir: Path) -> None:
     print("Finished preparing Data Importer assets. Files are located at", importer_dir)
 
 
+def build_job_zone_nodes(source_dir: Path) -> pd.DataFrame:
+    path = source_dir / "Job Zone Reference.xlsx"
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = load_excel_table(path)
+    required_cols = {
+        "Job Zone",
+        "Name",
+        "Experience",
+        "Education",
+        "Job Training",
+        "Examples",
+        "SVP Range",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise SystemExit(f"Job Zone Reference.xlsx missing columns: {sorted(missing)}")
+
+    df = df.rename(
+        columns={
+            "Job Zone": "job_zone",
+            "Name": "title",
+            "Experience": "experience",
+            "Education": "education",
+            "Job Training": "job_training",
+            "Examples": "examples",
+            "SVP Range": "svp_range",
+        }
+    )
+    df["job_zone"] = df["job_zone"].astype(str).str.strip()
+    df["job_zone_id:ID(JobZone)"] = df["job_zone"].apply(lambda value: f"job_zone_{value}")
+    df["labels:LABEL"] = "JobZone"
+    df["description"] = ""
+    ordered = df[
+        [
+            "job_zone_id:ID(JobZone)",
+            "title",
+            "description",
+            "experience",
+            "education",
+            "job_training",
+            "examples",
+            "svp_range",
+            "labels:LABEL",
+        ]
+    ]
+    return ordered.drop_duplicates(subset=["job_zone_id:ID(JobZone)"])
+
+
+def build_job_zone_relationships(source_dir: Path) -> pd.DataFrame:
+    path = source_dir / "Job Zones.xlsx"
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = load_excel_table(path)
+    required_cols = {"O*NET-SOC Code", "Job Zone", "Date", "Domain Source"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise SystemExit(f"Job Zones.xlsx missing columns: {sorted(missing)}")
+
+    df = df.rename(
+        columns={
+            "O*NET-SOC Code": "start:START_ID(Occupation)",
+            "Job Zone": "job_zone",
+            "Date": "date",
+            "Domain Source": "source",
+        }
+    )
+    df["job_zone"] = df["job_zone"].astype(str).str.strip()
+    df["end:END_ID(JobZone)"] = df["job_zone"].apply(lambda value: f"job_zone_{value}")
+    columns = [
+        "start:START_ID(Occupation)",
+        "end:END_ID(JobZone)",
+        "date",
+        "source",
+    ]
+    return df[columns].drop_duplicates(subset=["start:START_ID(Occupation)"])
+
+
+def build_technology_assets(source_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    path = source_dir / "Technology Skills.xlsx"
+    if not path.exists():
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = load_excel_table(path)
+    required_cols = {
+        "O*NET-SOC Code",
+        "Commodity Code",
+        "Commodity Title",
+        "Example",
+        "Hot Technology",
+        "In Demand",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise SystemExit(f"Technology Skills.xlsx missing columns: {sorted(missing)}")
+
+    df = df[df["Commodity Code"].notna() & df["Commodity Title"].notna()]
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df["Commodity Code"] = df["Commodity Code"].astype(str).str.strip()
+    nodes = (
+        df[["Commodity Code", "Commodity Title"]]
+        .drop_duplicates()
+        .rename(
+            columns={
+                "Commodity Code": "technology_id:ID(Technology)",
+                "Commodity Title": "name",
+            }
+        )
+    )
+    nodes["labels:LABEL"] = "Technology"
+
+    rels = df.rename(
+        columns={
+            "O*NET-SOC Code": "start:START_ID(Occupation)",
+            "Commodity Code": "end:END_ID(Technology)",
+            "Example": "example",
+        }
+    )
+    rels["end:END_ID(Technology)"] = rels["end:END_ID(Technology)"].astype(str).str.strip()
+    rels["hot_technology"] = _normalize_flag(rels["Hot Technology"])
+    rels["in_demand"] = _normalize_flag(rels["In Demand"])
+    rels = rels[
+        [
+            "start:START_ID(Occupation)",
+            "end:END_ID(Technology)",
+            "example",
+            "hot_technology",
+            "in_demand",
+        ]
+    ].drop_duplicates()
+
+    return nodes, rels
+
+
+def build_tool_assets(source_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    path = source_dir / "Tools Used.xlsx"
+    if not path.exists():
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = load_excel_table(path)
+    required_cols = {
+        "O*NET-SOC Code",
+        "Commodity Code",
+        "Commodity Title",
+        "Example",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise SystemExit(f"Tools Used.xlsx missing columns: {sorted(missing)}")
+
+    df = df[df["Commodity Code"].notna() & df["Commodity Title"].notna()]
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df["Commodity Code"] = df["Commodity Code"].astype(str).str.strip()
+    nodes = (
+        df[["Commodity Code", "Commodity Title"]]
+        .drop_duplicates()
+        .rename(
+            columns={
+                "Commodity Code": "tool_id:ID(Tool)",
+                "Commodity Title": "name",
+            }
+        )
+    )
+    nodes["labels:LABEL"] = "Tool"
+
+    rels = df.rename(
+        columns={
+            "O*NET-SOC Code": "start:START_ID(Occupation)",
+            "Commodity Code": "end:END_ID(Tool)",
+            "Example": "example",
+        }
+    )
+    rels["end:END_ID(Tool)"] = rels["end:END_ID(Tool)"].astype(str).str.strip()
+    rels = rels[
+        [
+            "start:START_ID(Occupation)",
+            "end:END_ID(Tool)",
+            "example",
+        ]
+    ].drop_duplicates()
+    return nodes, rels
+
+
+def build_task_nodes(source_dir: Path) -> pd.DataFrame:
+    path = source_dir / "Task Statements.xlsx"
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = load_excel_table(path)
+    required_cols = {
+        "Task ID",
+        "Task",
+        "Task Type",
+        "Incumbents Responding",
+        "Date",
+        "Domain Source",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise SystemExit(f"Task Statements.xlsx missing columns: {sorted(missing)}")
+
+    df = df[df["Task ID"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+
+    df["Task ID"] = df["Task ID"].astype(str).str.strip()
+    tasks = (
+        df.sort_values(by=["Task ID", "Date"], ascending=[True, False])
+        .drop_duplicates(subset=["Task ID"])
+        .rename(
+            columns={
+                "Task ID": "task_id:ID(Task)",
+                "Task": "name",
+                "Task Type": "task_type",
+                "Incumbents Responding": "incumbents_responding",
+                "Date": "date",
+                "Domain Source": "source",
+            }
+        )
+    )
+    tasks["task_id:ID(Task)"] = tasks["task_id:ID(Task)"].apply(lambda value: f"task_{value}")
+    tasks["incumbents_responding"] = pd.to_numeric(tasks["incumbents_responding"], errors="coerce")
+    tasks["labels:LABEL"] = "Task"
+    columns = [
+        "task_id:ID(Task)",
+        "name",
+        "task_type",
+        "incumbents_responding",
+        "date",
+        "source",
+        "labels:LABEL",
+    ]
+    return tasks[columns]
+
+
+def build_task_relationships(source_dir: Path) -> pd.DataFrame:
+    path = source_dir / "Task Ratings.xlsx"
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = load_excel_table(path)
+    required_cols = {
+        "O*NET-SOC Code",
+        "Task ID",
+        "Scale ID",
+        "Data Value",
+        "Category",
+        "N",
+        "Standard Error",
+        "Lower CI Bound",
+        "Upper CI Bound",
+        "Date",
+        "Domain Source",
+        "Recommend Suppress",
+    }
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise SystemExit(f"Task Ratings.xlsx missing columns: {sorted(missing)}")
+
+    df = df[df["Task ID"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df[df["Recommend Suppress"] != "Y"]
+    df["Data Value"] = pd.to_numeric(df["Data Value"], errors="coerce")
+    df = df.dropna(subset=["Data Value"])
+    if df.empty:
+        return pd.DataFrame()
+
+    df["Task ID"] = df["Task ID"].astype(str).str.strip()
+    pivot = (
+        df.pivot_table(
+            index=["O*NET-SOC Code", "Task ID"],
+            columns="Scale ID",
+            values="Data Value",
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+
+    scale_map = {
+        "FT": "frequency",
+        "IM": "importance",
+        "RT": "relevance",
+    }
+    rename_map = {scale: name for scale, name in scale_map.items() if scale in pivot.columns}
+    pivot = pivot.rename(columns=rename_map)
+
+    meta_cols = [
+        "Category",
+        "N",
+        "Standard Error",
+        "Lower CI Bound",
+        "Upper CI Bound",
+        "Date",
+        "Domain Source",
+    ]
+    meta = (
+        df.groupby(["O*NET-SOC Code", "Task ID"])[meta_cols]
+        .first()
+        .reset_index()
+        .rename(
+            columns={
+                "Category": "category",
+                "N": "sample_size",
+                "Standard Error": "standard_error",
+                "Lower CI Bound": "lower_ci",
+                "Upper CI Bound": "upper_ci",
+                "Date": "date",
+                "Domain Source": "source",
+            }
+        )
+    )
+    pivot = pivot.merge(meta, on=["O*NET-SOC Code", "Task ID"], how="left")
+
+    for column in ("frequency", "importance", "relevance"):
+        if column in pivot.columns:
+            pivot[column] = pd.to_numeric(pivot[column], errors="coerce")
+    for column in ("sample_size", "standard_error", "lower_ci", "upper_ci"):
+        if column in pivot.columns:
+            pivot[column] = pd.to_numeric(pivot[column], errors="coerce")
+
+    pivot = pivot.rename(
+        columns={
+            "O*NET-SOC Code": "start:START_ID(Occupation)",
+            "Task ID": "task_id",
+        }
+    )
+    pivot["end:END_ID(Task)"] = pivot["task_id"].apply(lambda value: f"task_{value}")
+    columns = [
+        "start:START_ID(Occupation)",
+        "end:END_ID(Task)",
+        "category",
+        "frequency",
+        "importance",
+        "relevance",
+        "sample_size",
+        "standard_error",
+        "lower_ci",
+        "upper_ci",
+        "date",
+        "source",
+    ]
+    available_cols = [col for col in columns if col in pivot.columns]
+    return pivot[available_cols]
+
+
+def build_task_to_dwa_relationships(
+    source_dir: Path,
+    element_records: Dict[str, Dict[str, str]],
+    element_labels: Dict[str, set[str]],
+) -> pd.DataFrame:
+    path = source_dir / "Tasks to DWAs.xlsx"
+    if not path.exists():
+        return pd.DataFrame()
+
+    df = load_excel_table(path)
+    required_cols = {"Task ID", "DWA ID", "DWA Title", "Date", "Domain Source"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise SystemExit(f"Tasks to DWAs.xlsx missing columns: {sorted(missing)}")
+
+    df = df[df["Task ID"].notna() & df["DWA ID"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+
+    df["Task ID"] = df["Task ID"].astype(str).str.strip()
+    df["DWA ID"] = df["DWA ID"].astype(str).str.strip()
+
+    for dwa_id, title in zip(df["DWA ID"], df["DWA Title"]):
+        if dwa_id not in element_records:
+            element_records[dwa_id] = {
+                "element_id": dwa_id,
+                "name": title or dwa_id,
+                "description": "",
+                "parent_id": compute_parent(dwa_id),
+                "depth": element_depth(dwa_id),
+                "base_type": base_type_for_depth(element_depth(dwa_id)),
+            }
+        element_labels.setdefault(dwa_id, {"ContentElement"}).add("DetailedWorkActivity")
+
+    rels = df.rename(
+        columns={
+            "Task ID": "start:START_ID(Task)",
+            "DWA ID": "end:END_ID(ContentElement)",
+            "Date": "date",
+            "Domain Source": "source",
+        }
+    )
+    rels["start:START_ID(Task)"] = rels["start:START_ID(Task)"].apply(lambda value: f"task_{value}")
+    rels = rels[
+        [
+            "start:START_ID(Task)",
+            "end:END_ID(ContentElement)",
+            "date",
+            "source",
+        ]
+    ].drop_duplicates()
+    return rels
+
+
 def build_graph_assets(source: Path, out_dir: Path, include_crosswalks: bool, emit_importer_ready: bool) -> None:
     out_nodes = out_dir / "nodes"
     out_relationships = out_dir / "relationships"
@@ -568,6 +986,35 @@ def build_graph_assets(source: Path, out_dir: Path, include_crosswalks: bool, em
                 continue
             rel_path = out_relationships / f"descriptor_{spec.relationship.lower()}.csv"
             write_relationship(rel_df, rel_path, spec.relationship)
+
+    job_zone_nodes = build_job_zone_nodes(source)
+    if not job_zone_nodes.empty:
+        write_nodes(job_zone_nodes, out_nodes / "job_zones.csv", "job_zone_id:ID(JobZone)")
+        job_zone_rels = build_job_zone_relationships(source)
+        if not job_zone_rels.empty:
+            write_relationship(job_zone_rels, out_relationships / "occupation_has_job_zone.csv", "HAS_JOB_ZONE")
+
+    tech_nodes, tech_rels = build_technology_assets(source)
+    if not tech_nodes.empty:
+        write_nodes(tech_nodes, out_nodes / "technologies.csv", "technology_id:ID(Technology)")
+    if not tech_rels.empty:
+        write_relationship(tech_rels, out_relationships / "occupation_uses_technology.csv", "USES_TECHNOLOGY")
+
+    tool_nodes, tool_rels = build_tool_assets(source)
+    if not tool_nodes.empty:
+        write_nodes(tool_nodes, out_nodes / "tools.csv", "tool_id:ID(Tool)")
+    if not tool_rels.empty:
+        write_relationship(tool_rels, out_relationships / "occupation_uses_tool.csv", "USES_TOOL")
+
+    task_nodes = build_task_nodes(source)
+    if not task_nodes.empty:
+        write_nodes(task_nodes, out_nodes / "tasks.csv", "task_id:ID(Task)")
+    task_rels = build_task_relationships(source)
+    if not task_rels.empty:
+        write_relationship(task_rels, out_relationships / "occupation_performs_task.csv", "PERFORMS_TASK")
+    task_dwa_rels = build_task_to_dwa_relationships(source, element_records, element_labels)
+    if not task_dwa_rels.empty:
+        write_relationship(task_dwa_rels, out_relationships / "task_aligns_dwa.csv", "ALIGNS_WITH_DWA")
 
     element_nodes = assemble_element_nodes(element_records, element_labels)
     write_nodes(element_nodes, out_nodes / "content_elements.csv", "element_id:ID(ContentElement)")
