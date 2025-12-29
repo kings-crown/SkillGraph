@@ -189,6 +189,89 @@ is deduplicated on `(occupation, commodity)` pairs.
 
 ---
 
+## Build & Import Workflow Overview
+
+The SkillGraph build process couples `Onet.py` (CSV generation) with `create_dump.py` and
+`neo4j-admin` (bulk import + dump creation). Understanding this flow helps explain how the
+Excel delivery becomes a Neo4j knowledge graph.
+
+### Step 1 – Generate Structured CSVs (`Onet.py`)
+
+1. `Onet.py build --source db_30_0_excel --out neo4j_csv --include-crosswalks --emit-importer-ready`
+2. Each workbook is mapped to typed node/relationship CSVs with annotated headers
+   (`code:ID(Occupation)`, `start:START_ID(...)`, `:TYPE`).
+3. Optional sanitized variants land under `neo4j_csv/data_importer_ready/` for Neo4j Data
+   Importer and Aura workflows.
+
+### Step 2 – Stage CSVs for Neo4j (`create_dump.py`)
+
+1. Confirms the presence of `neo4j-admin`, Python with `pandas/openpyxl`, and the Excel bundle.
+2. Optionally reruns `Onet.py build` (skip with `--skip-build`).
+3. Copies CSVs into Neo4j’s `import/nodes/` and `import/relationships/` directories, clearing
+   old files (`copy_csvs`).
+4. Removes existing `databases/<db>` and `transactions/<db>` directories to prepare for bulk
+   import.
+
+### Step 3 – Bulk Import with `neo4j-admin database import full`
+
+A representative command (shortened for readability):
+
+```bash
+neo4j-admin database import full \
+  --overwrite-destination \
+  --nodes=Occupation=import/nodes/occupations.csv \
+  --nodes=ContentElement=import/nodes/content_elements.csv \
+  --nodes=JobZone=import/nodes/job_zones.csv \
+  --nodes=Technology=import/nodes/technologies.csv \
+  --nodes=Tool=import/nodes/tools.csv \
+  --nodes=Task=import/nodes/tasks.csv \
+  --relationships=HAS_CHILD=import/relationships/content_hierarchy.csv \
+  --relationships=REQUIRES_SKILL=import/relationships/occupation_requires_skill.csv \
+  --relationships=PERFORMS_TASK=import/relationships/occupation_performs_task.csv \
+  --relationships=ALIGNS_WITH_DWA=import/relationships/task_aligns_dwa.csv \
+  --relationships=USES_TECHNOLOGY=import/relationships/occupation_uses_technology.csv \
+  --relationships=USES_TOOL=import/relationships/occupation_uses_tool.csv \
+  --relationships=HAS_JOB_ZONE=import/relationships/occupation_has_job_zone.csv \
+  --relationships=ABILITY_SUPPORTS_ACTIVITY=import/relationships/descriptor_ability_supports_activity.csv \
+  --relationships=SKILL_RELATES_CONTEXT=import/relationships/descriptor_skill_relates_context.csv \
+  ... \
+  -- onet
+```
+
+ Key behaviors (from Neo4j documentation):
+
+ - Runs offline; `--overwrite-destination` wipes an existing `onet` store before writing.
+ - Header tokens (`:ID`, `:START_ID`, `:END_ID`, `:TYPE`) define identifiers and relationship
+   types; additional columns become properties with inferred data types.
+ - Supports multiple `--nodes` / `--relationships` arguments; the importer merges every file
+   that shares the same label or relationship type.
+ - Validates referential integrity; rows referencing missing node IDs abort the import unless
+   you explicitly allow bad relationships.
+ - Writes native store files directly, making it orders of magnitude faster than `LOAD CSV`.
+ - Offers tuning flags (`--delimiter`, `--array-delimiter`, `--trim-strings`, `--max-memory`,
+   etc.) if your dataset needs specialised parsing or memory settings.
+
+### Step 4 – Produce a Portable Dump
+
+After import, `create_dump.py` issues:
+
+```bash
+neo4j-admin database dump onet --to-path=<target_dir>
+```
+
+`neo4j-admin` packages the database into `onet.dump`, which the script zips to
+`onet_dump.zip`. The archive can be restored locally (`neo4j-admin database load`) or
+uploaded to Neo4j Aura via “Backup & Restore → Upload Dump”.
+
+### Sanitized vs. Raw CSVs
+
+The sanitized files under `data_importer_ready/` mirror the raw CSVs but rename headers
+(`start_occupation_id`, `type`, etc.) to satisfy the Neo4j Data Importer UI. Bulk import should
+use the raw CSVs because the header annotations (`:ID`, `:START_ID`, `:TYPE`) let
+`neo4j-admin` wire relationships automatically.
+
+---
+
 ## Maintained CSV Directory Structure
 
 After `Onet.py build`, the `--out` directory contains:
